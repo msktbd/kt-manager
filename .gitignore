@@ -1,0 +1,16 @@
+node_modules
+dist
+android
+ios
+*.apk
+*.aab
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.b64
+KT_*.txt
+.env
+.env.*
+*.log
+.DS_Store

@@ -1,0 +1,154 @@
+name: Build test APK
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-test-apk
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APP_ID: com.khurshedtraders.manager.spike
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Guard - no keystores or secrets tracked in git
+        run: |
+          bad=$(git ls-files | grep -Ei '\.(jks|keystore|p12|pfx)$|(^|/)\.env($|\.)|google-services\.json$|(^|/)KT_[A-Z_]+\.txt$' || true)
+          if [ -n "$bad" ]; then
+            echo "Forbidden files are tracked:"; echo "$bad"; exit 1
+          fi
+          if git grep -nE 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' -- . ':!.github/workflows'; then
+            echo "Possible secret found in source"; exit 1
+          fi
+          echo "OK: no keystore or secret files tracked"
+
+      - name: Require lockfile and signing secrets
+        env:
+          B64: ${{ secrets.KT_TEST_KEYSTORE_B64 }}
+          ALIAS: ${{ secrets.KT_TEST_KEY_ALIAS }}
+          PASS: ${{ secrets.KT_TEST_KEYSTORE_PASSWORD }}
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "::error::package-lock.json is missing. Run 'Generate lockfile (one-time)' first, then git pull."
+            exit 1
+          fi
+          for v in B64 ALIAS PASS; do
+            if [ -z "${!v}" ]; then
+              echo "::error::A required signing secret is missing (see setup steps: KT_TEST_KEYSTORE_B64, KT_TEST_KEY_ALIAS, KT_TEST_KEYSTORE_PASSWORD)."
+              exit 1
+            fi
+          done
+          echo "OK: lockfile and signing secrets present"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install dependencies (locked)
+        run: npm ci --no-audit --no-fund
+
+      - name: Build web app
+        env:
+          VITE_BUILD_NUMBER: ${{ github.run_number }}
+          VITE_COMMIT_SHA: ${{ github.sha }}
+        run: |
+          export VITE_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          npm run build
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Patch Android project
+        env:
+          EXPECTED_APP_ID: ${{ env.APP_ID }}
+        run: node scripts/patch-android.mjs
+
+      - name: Sync web assets into Android project
+        run: npx cap sync android
+
+      - name: Build release APK (unsigned)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Align, sign and verify APK
+        id: apk
+        env:
+          KT_TEST_KEYSTORE_B64: ${{ secrets.KT_TEST_KEYSTORE_B64 }}
+          KT_TEST_KEY_ALIAS: ${{ secrets.KT_TEST_KEY_ALIAS }}
+          KT_TEST_KEYSTORE_PASSWORD: ${{ secrets.KT_TEST_KEYSTORE_PASSWORD }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          umask 077
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
+          UNSIGNED=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          test -f "$UNSIGNED"
+
+          KS="$RUNNER_TEMP/kt-test.jks"
+          printf '%s' "$KT_TEST_KEYSTORE_B64" | base64 -d > "$KS"
+
+          NAME="kt-spike-b${RUN_NUMBER}-${GITHUB_SHA::7}.apk"
+          mkdir -p out
+          "${BT}zipalign" -f 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "${BT}apksigner" sign \
+            --ks "$KS" --ks-key-alias "$KT_TEST_KEY_ALIAS" \
+            --ks-pass env:KT_TEST_KEYSTORE_PASSWORD \
+            --key-pass env:KT_TEST_KEYSTORE_PASSWORD \
+            --v4-signing-enabled false \
+            --out "out/$NAME" "$RUNNER_TEMP/aligned.apk"
+
+          echo "== signature verification =="
+          "${BT}apksigner" verify --verbose --print-certs "out/$NAME" | tee out/certificate.txt
+
+          echo "== package info =="
+          "${BT}aapt2" dump badging "out/$NAME" | head -1 | tee out/package.txt
+          grep -q "name='${APP_ID}'" out/package.txt || { echo "::error::Unexpected package id"; exit 1; }
+          grep -q "versionCode='${RUN_NUMBER}'" out/package.txt || { echo "::error::Unexpected versionCode"; exit 1; }
+
+          APK_FP=$(grep -m1 'certificate SHA-256 digest' out/certificate.txt | awk '{print $NF}' | tr 'A-F' 'a-f')
+          KS_FP=$(keytool -list -v -keystore "$KS" -alias "$KT_TEST_KEY_ALIAS" \
+                    -storepass "$KT_TEST_KEYSTORE_PASSWORD" 2>/dev/null \
+                  | grep -m1 'SHA256:' | awk '{print $2}' | tr -d ':' | tr 'A-F' 'a-f')
+          if [ -z "$APK_FP" ] || [ "$APK_FP" != "$KS_FP" ]; then
+            echo "::error::APK certificate does not match the test keystore"; exit 1
+          fi
+
+          rm -f "$KS" "$RUNNER_TEMP/aligned.apk"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "fp=$APK_FP" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        run: |
+          {
+            echo "### Signed test APK ready"
+            echo "- File: \`${{ steps.apk.outputs.name }}\`"
+            echo "- Build: #${{ github.run_number }} - Commit: \`${GITHUB_SHA::7}\`"
+            echo "- Size: $(du -h "out/${{ steps.apk.outputs.name }}" | cut -f1)"
+            echo "- Certificate SHA-256: \`${{ steps.apk.outputs.fp }}\`"
+            echo ""
+            echo "This certificate must be identical in every build for install-over-update to work."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kt-spike-apk-b${{ github.run_number }}
+          path: out/
+          retention-days: 14
+          if-no-files-found: error
