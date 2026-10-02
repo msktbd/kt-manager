@@ -57,7 +57,14 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # The action's default packages are "tools platform-tools". The legacy
+      # "tools" package no longer exists, so sdkmanager exits with code 1.
+      # Install only platform-tools; Gradle/AGP downloads the platform and
+      # build-tools it needs (licenses are accepted by the action).
       - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+          accept-android-sdk-licenses: true
 
       - name: Install dependencies (locked)
         run: npm ci --no-audit --no-fund
